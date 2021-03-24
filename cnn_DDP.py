@@ -10,7 +10,7 @@ import random
 
 import torch
 import torch.nn as nn
-import torch.nn.parallel
+# import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
@@ -18,6 +18,7 @@ import torch.utils.data
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 import numpy as np
 import pandas as pd
@@ -41,11 +42,12 @@ def try_barrier(rank):
         dist.barrier()
     except:
         pass
-    
 
 class Net(nn.Module):
     def __init__(self):
-        super(Net, self).__init__()
+#         super(Net, self).__init__()
+        super().__init__()
+        
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
@@ -59,45 +61,37 @@ class Net(nn.Module):
         x = x.view(-1, 16 * 5 * 5)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x.to(device)
-
+        out = self.fc3(x)
+        return out
 
 def f_train_model(net,train_loader,num_epochs):
     
-    device = torch.cuda.current_device()
-    print(device)
-    
     for epoch in range(num_epochs):  # loop over the dataset multiple times
 
+        train_sampler.set_epoch(epoch)
         running_loss = 0.0
         for i, data in enumerate(train_loader):
-            print("i",i,device)
+#             print("i",i,device)
             # get the inputs; data is a list of [inputs, labels]
             inputs, labels = data[0].to(device),data[1].to(device)
             inputs=torch.reshape(inputs,(batch_size,3,32,32))
             labels=labels.long()
 #             optimizer.zero_grad()
-            print("before zero grad",i)
-            # forward + backward + optimize
+            ### forward + backward + optimize
             net.zero_grad()
             net.train()
-            print("before network call",local_rank)
             outputs = net(inputs)
-            print("before loss call")
             loss = criterion(outputs, labels)
             loss.backward()
-            print("before optimizer call",local_rank)
+#             print("before optimizer call",local_rank)
             optimizer.step()
-            print("after optimizer call",local_rank,i)
             
-            # print statistics
-#             running_loss += loss.item()
-#             print("before print",local_rank,i)
-#             if i % 2000 == 1999:    # print every 2000 mini-batches
-#                 print('[%d, %5d] loss: %.3f' %(epoch + 1, i + 1, running_loss / 2000))
-#                 running_loss = 0.0
-#             net.train()
+#             ##print statistics
+            running_loss += loss.item()
+#             print("before print",local_rank,epoch,i)
+            if i % 2000 == 1999:    # print every 2000 mini-batches
+                print('[%d, %5d] loss: %.3f' %(epoch + 1, i + 1, running_loss / 2000))
+                running_loss = 0.0
 
     print('Finished Training')
     
@@ -133,6 +127,7 @@ def f_test(data_loader,net):
     for i in range(10):
         print('Accuracy of %5s : %2d %%' % (classes[i], 100 * class_correct[i] / class_total[i]))
 
+
 if __name__=="__main__":
     
     parser=argparse.ArgumentParser()
@@ -143,24 +138,23 @@ if __name__=="__main__":
 
     batch_size=args.batch_size
     epochs=args.epochs
-#     batch_size=128
-#     epochs=10
+    
+    torch.backends.cudnn.benchmark = True
 
     ### Distributed data-parallel setup
     local_rank=args.local_rank    
+    verb=True if local_rank==0 else False
     
-    verb=False
-    if local_rank==0: verb=True
-    
+    torch.cuda.set_device(args.local_rank) ## Very important
     dist.init_process_group(backend='nccl', init_method="env://")  
+    world_rank = dist.get_rank()
     
-    world_rank = dist.get_rank() 
-    print("Local rank",local_rank)
-    print("World rank",world_rank)
-    
-    world_size, rank = torch.cuda.device_count(), torch.cuda.current_device()
+    ## #This gives wrong world_size
+#     world_size, rank = torch.cuda.device_count(), torch.cuda.current_device()
+#     print("world size b %s"%(world_size))
 
-#     raise SystemExit
+    world_size=int(os.environ['WORLD_SIZE'])
+    print("World size %s, world rank %s, local rank %s"%(world_size,world_rank,local_rank))
 
     #################
     ### Extract data
@@ -180,8 +174,10 @@ if __name__=="__main__":
     dataset=TensorDataset(torch.Tensor(train_x[:(size-val_size)]),torch.Tensor(train_y[:(size-val_size)]))
     train_loader=DataLoader(dataset,batch_size=batch_size,shuffle=True,num_workers=0,drop_last=True)
 
-#     train_sampler=torch.utils.data.distributed.DistributedSampler(dataset,num_replicas=world_size,rank=world_rank)
-#     train_loader=DataLoader(dataset,batch_size=batch_size,shuffle=False,num_workers=1,drop_last=True,sampler=train_sampler)
+    train_sampler=torch.utils.data.distributed.DistributedSampler(dataset,num_replicas=world_size,rank=world_rank)
+    train_sampler=torch.utils.data.distributed.DistributedSampler(dataset,shuffle=True)
+
+    train_loader=DataLoader(dataset,batch_size=batch_size,shuffle=False,num_workers=1,drop_last=True,sampler=train_sampler,pin_memory=torch.cuda.is_available())
 
     dataset=TensorDataset(torch.Tensor(train_x[-val_size:]),torch.Tensor(train_y[-val_size:]))
     val_loader=DataLoader(dataset,batch_size=batch_size,shuffle=True,num_workers=1,drop_last=True)
@@ -192,12 +188,9 @@ if __name__=="__main__":
     classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
     
     #################
-#     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    device=torch.cuda.current_device()
-    if verb:
-        print(device)
-        print("Using ",torch.cuda.device_count(), "GPUs")
-    
+    device = torch.cuda.current_device()
+    print("device %s local-rank %s"%(device,local_rank))
+
     # Build network
     net = Net().to(device)
     
@@ -205,23 +198,19 @@ if __name__=="__main__":
 #         torch.cuda.set_device(local_rank)
 #         model.cuda(local_rank)
     
-#     dist.barrier()
-    criterion = nn.CrossEntropyLoss().to(device)
-    print("After criterion def",local_rank)
+    criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
-    
     try_barrier(local_rank)
-    print("Before ddp call",local_rank)
-    net=nn.parallel.DistributedDataParallel(net,device_ids=[local_rank],output_device=[local_rank])
-    print("After ddp call",local_rank)
 
+    print("barrier %s %s"%(local_rank,device))
+    net=DistributedDataParallel(net,device_ids=[local_rank],output_device=[local_rank])
+        
     try_barrier(local_rank)
     
     t1=time.time()
     f_train_model(net,train_loader,epochs)
     t2=time.time()
-    print("Training time",t2-t1)
-    
+    print("Training time %s for rank %s"%(t2-t1,world_rank))
+
     if local_rank==0: 
         f_test(test_loader,net)
-    

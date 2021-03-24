@@ -50,7 +50,7 @@ class Net(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
-        return x.to(device)
+        return x
 
 def f_train_model(net,train_loader,num_epochs):
     for epoch in range(num_epochs):  # loop over the dataset multiple times
